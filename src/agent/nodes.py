@@ -1,189 +1,234 @@
 import logging
+import asyncio
+from typing import List, Optional
+from functools import lru_cache
+import random
+
 from langchain_core.messages import AIMessage, SystemMessage, HumanMessage
 from langchain_core.runnables.config import RunnableConfig
-from langgraph.types import Command
-from .state import MessagesState
-from src.tools.sql_tools import execute_sql
-from functools import lru_cache
-from src.core.llm_client import get_llm
-from langgraph.store.base import BaseStore  # 用于类型提示
+from langgraph.types import Command, Send
+from langgraph.store.base import BaseStore
 from pydantic import BaseModel, Field
-from src.tools.sql_tools  import search_knowledge_base
+from typing import List, Optional, Literal, Annotated
+from .state import MessagesState, WorkerState  # 确保导入了这两个状态
+from src.core.llm_client import get_llm
+from src.tools.sql_tools import execute_sql, search_knowledge_base
 
 logger = logging.getLogger(__name__)
 
-llm = None
-llm_with_tools = None
 
-# ================== 知识库单例延迟加载，彻底消除循环依赖 ==================
-# 不在模块顶层实例化，改为按需加载
+# ================== 1. 结构化协议定义 (集团化核心) ==================
+
+class UserMemory(BaseModel):
+    has_preference: bool = Field(description="用户是否表达了个人喜好或特征？")
+    preference_content: str = Field(description="提取的特征内容")
+
+
+class IntentOutput(BaseModel):
+    """【意图分发表】：强迫大模型按此结构化格式汇报"""
+    route: Literal["business", "analysis", "meta", "chat", "parallel"] = Field(
+        description="意图标签：查询数据走 business, 深度归因走 analysis, 查表结构走 meta, 闲聊走 chat, 批量对比或多目标排查走 parallel"
+    )
+    targets: List[str] = Field(
+        default_factory=list,
+        description="当意图为 parallel 时，提取用户提到的所有目标实体名单（如公司名、人名）。如果是单目标查询，此项为空。"
+    )
+    chat_reply: Optional[str] = Field(
+        None, description="如果意图是 chat，在这里给出幽默的探员式回复"
+    )
+
+
+# ================== 2. 基础单例加载 ==================
+
 @lru_cache(maxsize=1)
 def get_kb_instance():
-    """获取 KnowledgeBase 单例，并确保索引已加载"""
-    from src.core.vector_store import KnowledgeBase  # 延迟导入，避免循环依赖
+    from src.core.vector_store import KnowledgeBase
     kb = KnowledgeBase()
-    if not kb.load_index():
-        kb.build_index()
+    if not kb.load_index(): kb.build_index()
     return kb
-# ========================================================================
+
 
 @lru_cache(maxsize=1)
 def get_llm_with_tools():
-    """获取挂载了工具的大模型单例实例"""
     _llm = get_llm()
-    if _llm is None:
-        raise ValueError("❌ 大模型初始化失败，请检查环境变量配置！")
+    if _llm is None: raise ValueError("❌ LLM 初始化失败")
     return _llm.bind_tools([execute_sql, search_knowledge_base])
 
-def initialize_llm(llm_instance):
-    """兼容旧接口：初始化全局 llm 和 llm_with_tools"""
-    global llm, llm_with_tools
-    llm = llm_instance
-    llm_with_tools = llm.bind_tools([execute_sql])
 
-class UserMemory(BaseModel):
-    has_preference: bool = Field(description="用户是否在这句话中明确表达了个人喜好、习惯、身份或人物特征？")
-    preference_content: str = Field(description="如果表达了特征，请提取具体内容(精简为短语，如'喜欢喝咖啡'、'我是审计部的')；如果没有，返回空字符串。")
+# ================== 3. 核心节点逻辑 ==================
 
 async def intent_node(state: MessagesState, config: RunnableConfig, store: BaseStore):
     user_name = config.get("configurable", {}).get("user_name", "Jack")
-    user_role = config.get("configurable", {}).get("role", "admin")
-    if not state.messages:
-        logger.warning("intent_node: 消息列表为空，直接路由到 chat")
-        return {"route": "chat"}
-    last_msg_content = state.messages[-1].content.strip()
     _llm = get_llm()
-    if _llm is None:
-        error_msg = "❌ 大模型初始化失败，请检查 .env 文件配置。"
-        logger.error("intent_node: %s", error_msg)
-        return {"messages": [AIMessage(content=error_msg)], "route": "chat"}
-    ## LangGraph 强制要求用元组做 Namespace。 用元组是Python语言体系的一个设计套路，类似于目录层级结构。
-    namespace = ("user_profiles", user_name)
-    ## 强行约束大模型，让它必须、只能、且完美地按照 UserMemory 这个类定义的格式返回数据。
-    ## 自动把 UserMemory 的结构转换成大模型能听懂的“函数定义”或“JSON Schema”发过去
-    memory_extractor = _llm.with_structured_output(UserMemory)
+    last_msg_content = state.messages[-1].content.strip()
+    # --- 🧠 结构化意图大脑 ---
+    # 绑定协议：告诉 LLM，你必须返回 IntentOutput 定义的 JSON 格式
+    intent_analyzer = _llm.with_structured_output(IntentOutput)
+
+    system_prompt = """你现在是星际金融风控局的指挥中心。
+    你的任务是分析用户的输入，并决定由哪个部门接手。
+
+    1. 【PARALLEL】：当用户要求'对比'、'排查这几家'、'看看他们三个'等涉及多个实体的指令时。
+       - 关键：你必须精准提取出名单列表存入 targets。
+    2. 【ANALYSIS】：询问'为什么'、'原因'、'归因排查'。
+    3. 【BUSINESS】：单一的业务咨询或数据查询。
+    4. 【META】：问表结构、有哪些表。
+    5. 【CHAT】：闲聊、打招呼。
+    """
+
+    # 让 LLM 开始思考并提取
     try:
-        memory_result = await memory_extractor.ainvoke([
-            SystemMessage(
-                content="你是一个心理分析师，任务是从用户的日常对话中提取他们的长期偏好或个人特征。如果没有明确特征，不要凭空捏造。"),
+        decision = await intent_analyzer.ainvoke([
+            SystemMessage(content=system_prompt),
             HumanMessage(content=last_msg_content)
         ])
-        if memory_result and memory_result.has_preference and memory_result.preference_content:
-            ## .aput = Asynchronous Put 异步”操作
-            await store.aput(namespace, "preference", {"likes": memory_result.preference_content})
-            ## 结构化后的数据方便我们直接拿来用：memory_result.preference_content
-            logger.info(f"💾 [Store API]: 智能提取并持久化特征 -> [{memory_result.preference_content}]")
+
+        logger.info(f"🧠 [局长大脑决策]：意图={decision.route}, 目标={decision.targets}")
+
+        # 如果是闲聊，直接把 LLM 写好的回复包在消息里
+        if decision.route == "chat":
+            return {
+                "route": "chat",
+                "messages": [AIMessage(content=decision.chat_reply or "敬礼！探长！")]
+            }
+
+        # 核心返回：route 决定去哪，targets 决定分身分裂出多少个
+        return {
+            "route": decision.route,
+            "targets": decision.targets,
+            "messages": [
+                AIMessage(content=f"📝 指挥部指令：转交【{decision.route.upper()}】部门，涉及目标：{decision.targets}")]
+        }
+
     except Exception as e:
-        logger.warning(f"记忆提取环节发生异常 (非致命，跳过): {e}")
-    profile = await store.aget(namespace, "preference")
+        logger.error(f"决策大脑故障: {e}")
+        return {"route": "chat", "messages": [AIMessage(content="报告探长，我刚才走神了，能再说一遍吗？")]}
 
-   #================================= 物理拦截模式（快通道）：基于关键词的硬规则优先级最高 =================================
-    known_preference = profile.value.get("likes") if profile else None
-    META_KEYWORDS = ["表", "字段", "结构", "元数据", "有哪些表", "schema"]
-    ANALYSIS_KEYWORDS = ["为什么", "原因", "分析", "归因", "排查"]
-
-    for kw in META_KEYWORDS:
-        if kw in last_msg_content:
-            logger.info("intent_node: 关键字[%s]触发物理拦截 → meta", kw)
-            return {"messages": [AIMessage(content="【META】")], "route": "meta"}
-    for kw in ANALYSIS_KEYWORDS:
-        if kw in last_msg_content:
-            logger.info("intent_node: 关键字[%s]触发物理拦截 → analysis", kw)
-            return {"messages": [AIMessage(content="【ANALYSIS】")], "route": "analysis"}
-    # ===============================大模型（慢通道）====================================================
-
-    system_prompt = """你是一个极其严谨的星际金融风控局前台接待员（意图路由器）。
-        请严格根据用户的输入，将其划分到以下四个意图之一：
-
-        1. 【BUSINESS】（业务数据与知识查询）🎯：
-           - 当用户询问具体的业务数据（如“有多少客户”、“逾期金额是多少”）。
-           - 当用户询问金融风控术语（如“什么是 DPD”、“解释一下 M1/M2”）。
-           - 当用户询问公司内部政策、规章制度、催收操作手册（如“M2的惩罚策略是什么”）。
-           ⚠️ 极其重要：所有名词解释、政策查询，一律归为 BUSINESS！
-
-        2. 【ANALYSIS】（根因与异常分析）📉：
-           - 当用户发现某个指标发生异动，要求查明原因时（如“为什么上个月的坏账率突然升高了”、“帮我排查一下订单量下降的归因”）。
-           ⚠️ 注意：不要把简单的名词“解释”归类为“分析”！
-
-        3. 【META】（数据库元数据）📊：
-           - 当用户询问数据库表结构、有哪些表、字段代表什么意思时。
-
-        4. 【CHAT】（闲聊与问候）☕：
-           - 日常打招呼、夸奖、或者与金融风控无关的闲聊。
-
-        回复格式要求：如果是 CHAT，回复 【CHAT】+ 一句符合探员身份的幽默回应；如果是其他三类，请严格只回复【标签名】（如 【BUSINESS】），绝不要输出任何其他字符！"""
-    res = await _llm.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=last_msg_content)])
-    res_text = res.content.upper()
-    logger.info("intent_node: LLM 分类结果 → %s", res_text[:50])
-
-    if "CHAT" in res_text:
-        reply = res.content.replace("【CHAT】", "").strip()
-        ## 在闲聊的情况下，如果之前记忆里提取到了用户的偏好特征，就把它优雅地融入回复里，增加个性化和温度。
-        if known_preference:
-            personalized_reply = f"[权限: {user_role}] 敬礼！{user_name}！我知道您【{known_preference}】！{reply}"
-        else:
-            personalized_reply = f"[权限: {user_role}] 敬礼！{user_name}！{reply}"
-        return {"messages": [AIMessage(content=personalized_reply)], "route": "chat"}
-    elif "META" in res_text:
-        return {"messages": [res], "route": "meta"}
-    elif "ANALYSIS" in res_text:
-        return {"messages": [res], "route": "analysis"}
-    else:
-        return {"messages": [res], "route": "business"}
-
-async def check_data_freshness_node(state: MessagesState):
-    date = "2024-12-23"
-    return {"messages": [SystemMessage(content=f"当前数据截止到 {date}。")], "data_freshness": date}
 
 async def generate_sql_node(state: MessagesState, config: RunnableConfig):
+    """【SQL 侦探】：负责精准查数"""
     _llm_with_tools = get_llm_with_tools()
-
-    ## 可以根据 config 里的用户信息动态调整提示词，增强个性化和安全性。「在每个节点都可以用到」
-    user_name = config.get("configurable", {}).get("user_name", "未知员工")
-    user_role = config.get("configurable", {}).get("role", "user")
-
+    user_name = config.get("configurable", {}).get("user_name", "探员")
     messages = state.messages
-    last_msg = messages[-1] if messages else None
-    last_msg_content = last_msg.content if last_msg else ""
 
-    correction_prompt = ""
+    # 构建纠错指令（HITL 或 ERROR）
+    correction = ""
+    if "ERROR" in messages[-1].content:
+        correction = f"\n[🚩 纠错]：前次执行报错 {messages[-1].content}，请修正 SQL。"
 
-    # 情景A：人类导师反馈纠错
-    # isinstance(last_msg, HumanMessage)：最后一条消息必须是人类发出的。
-    if isinstance(last_msg, HumanMessage) and len(messages) > 1:
-        correction_prompt = (
-            "\n[👨‍💼 人类导师反馈]\n"
-            f"反馈内容：{last_msg_content}\n"
-            "请仔细阅读上述人类反馈修正 SQL。如果提供了完整 SQL 则原封不动执行。"
-        )
+    sys_msg = SystemMessage(content=f"你是 SQL 侦探。操作员是 {user_name}。必须调用 execute_sql。{correction}")
 
-    # 情景B：系统级物理纠错
-    elif "ERROR" in last_msg_content:
-        correction_prompt = (
-            "\n[🚩 紧急纠错指令]\n"
-            f"错误信息为: {last_msg_content}\n"
-            "请分析原因修正 SQL 后再次调用。"
-        )
+    response = await _llm_with_tools.ainvoke([sys_msg] + messages[-10:])
+    return {"messages": [response]}
 
-    role_instruction = ""
-    if user_role == "admin":
-        role_instruction = f"3. 【权限最高级】：当前操作者是 {user_name} (Admin)，拥有所有数据库表的无限制查询权限。"
-    else:
-        role_instruction = f"3. 【权限受限】：当前操作者是 {user_name} ({user_role})，生成的 SQL 必须严格限制范围，严禁查询薪酬、密码等高管敏感表！"
 
-    sys_instruction = SystemMessage(content=(
-        "你是一个严谨的金融 SQL 侦探。\n"
-        "1. 严禁幻觉：必须且只能使用 `execute_sql` 获取数据。\n"
-        "2. 命名规范：严格遵守数据库表名，SQLite 中不要随意加复数 's'。\n"
-        f"{role_instruction}\n"
-        f"{correction_prompt}"
-    ))
+# ================== 4. 集团篇：分身术专属节点 ==================
 
-    input_msgs = [sys_instruction] + messages[-10:]
+# src/agent/nodes.py
+# 🌟 记得在顶部导入 create_react_agent
+from langgraph.prebuilt import create_react_agent
+
+## 这是通过 Send API 并发触发的节点!!!!
+async def parallel_detective_node(state: dict):
+    target = state.get("target", "未知目标")
+    logger.info(f"🕵️‍♂️ [分身出勤]: 正在数据库中搜寻 {target} 的真实记录...")
+
+    # =================================================================
+    # 🛡️ 架构师级限流：随机错峰 0.5 到 2.5 秒，防止击穿 DashScope QPS，否则会报错的！云端大模型的保护机制
+    # =================================================================
+    delay = random.uniform(0.5, 2.5)
+    logger.info(f"⏳ [错峰限流] 探员 {target} 正在通道排队，等待 {delay:.1f} 秒...")
+    await asyncio.sleep(delay)
+
+    _llm = get_llm()
+    ## 函数在底层帮你写好了一个 while 循环（也就是一个小型的 LangGraph），让他具备了 ReAct (Reason 推理 + Act 行动) 的能力
+    mini_agent = create_react_agent(_llm, tools=[execute_sql])
+
+    # =================================================================
+    # 🚨 探长高亮修改区：为探员配发精准的“数据库地图” (Prompt Engineering)
+    # =================================================================
+    # 🌟 进阶版：赋予探员自主探索能力的通用 Prompt。 但是可能会浪费token,反复推敲试探。
+    mission = f"""你是一个高级金融数据侦探，当前的专项排查目标是实体：【{target}】。
+        你的任务是利用 execute_sql 工具，在数据库中搜寻关于该目标的所有高风险线索（如信用情况、负债、逾期或交易异常等）。
+
+        🕵️‍♂️ 侦查行动指南：
+        1. 【摸底】：如果你不知道当前数据库有哪些表，请先用 SQL 查询系统表（例如 `SELECT name, sql FROM sqlite_master WHERE type='table';`）来了解表结构。
+        2. 【搜证】：根据分析得出的表结构，尝试编写 SQL 查找与【{target}】相关的数据。请灵活应对，目标名称的列名可能是 target_name, name, company_name 等。如果一张表查不到，可以尝试其他相关表。
+        3. 【结案】：综合你查到的所有真实数据，为探长输出一段专业、客观的风险审计结论。
+
+        🚨 铁律：
+        - 绝不允许凭空捏造数据或常识性编造！
+        - 如果经过多次 SQL 查询（尝试了不同表和字段）后，确无该目标任何记录，请如实回复：“经全面排查，数据库中未见【{target}】的相关记录。”"""
+    # =================================================================
+    ## 方便快速测试的简化版 Prompt（直接给表结构，省去摸底环节）。暂时不用的
+    mission_for_test = f"""你是一个审计探员，目标是：【{target}】。
+    必须使用 execute_sql 工具，查询 `risk_indicators` 表。
+    ⚠️ 核心机密（表结构绝对约束）：
+    - 目标名称所在的列名叫作 `target_name` （请务必使用 WHERE target_name = '{target}'）
+    - 严禁盲目猜测列名（如 name, user_name 等）！
+    请查出该目标的 credit_score (信用分), dpd (逾期天数) 和 recent_status (当前状态)。
+    如果查不到，如实报告；如果查到了，请根据数据给出一句风险研判。"""
     try:
-        logger.info(f"generate_sql_node: 正在调度 AI... [当前权限: {user_role}]")
-        response = await _llm_with_tools.ainvoke(input_msgs)
-        return {"messages": [response]}
+        # 捕捉微型智能体的内部异常
+        result = await mini_agent.ainvoke({"messages": [SystemMessage(content=mission)]})
+        final_answer = result["messages"][-1].content
     except Exception as e:
-        logger.error("大脑节点崩溃: %s", str(e))
-        return {"messages": [AIMessage(content=f"❌ 侦探大脑思考时发生意外: {str(e)}")]}
+        logger.error(f"❌· 探员 {target} 呼叫总台失败: {e}")
+        final_answer = f"由于星际通讯干扰 (API Error)，暂未获取到 {target} 的详细情报。"
+
+    final_report = f"📊 【{target} 真实审计结果】：\n{final_answer}"
+
+    return {
+        "parallel_reports": [final_report],
+        "messages": [AIMessage(content=f"✅ [{target}] 专线实地考察已结束。")]
+    }
+
+def distribute_tasks(state: MessagesState):
+    """【分发器】：LangGraph 的分身术发动器"""
+    targets = state.targets
+    if not targets:
+        logger.warning("未检测到具体对比清单，回退至闲聊模式")
+        return "chat"
+
+    logger.info(f"🌀 [发动分身术]：目标清单 {targets}")
+
+    # 🌟 灵魂：返回 Send 对象的列表，框架会自动并行执行 parallel_detective_node
+    # 分发（Fan-out）：intent 节点通过 Send 把状态分裂成多个小包裹。跟Fan-in/Reduce成对的。 graph.py 文件里面叫parallel_detective
+    return [Send("parallel_detective", {"target": t}) for t in targets]
+
+
+## 因为 MessagesState.parallel_reports 使用了 operator.add，
+# 所以当多个分身节点指向同一个 aggregate_reports 节点时，LangGraph 会自动等待所有分身执行完毕，并把他们的报告全部塞进那个列表里，再交给汇总官。
+async def aggregate_reports_node(state: MessagesState):
+    """
+    【集团主编】：负责把所有分身探员交上来的零散报告，整合成一份最终研报。
+    """
+    reports = state.parallel_reports
+    _llm = get_llm()
+
+    if not reports:
+        return {"messages": [AIMessage(content="报告探长，分身探员们空手而归，未找到有效信息。")]}
+
+    # 把散落的报告拼起来作为上下文
+    combined_context = "\n\n".join(reports)
+
+    system_prompt = """你是一个星际风控局的首席审计官。
+    请将以下几份来自不同分身探员的审计片段，整合成一份结构清晰、语气专业的【集团对比审计研报】。
+    要求：
+    1. 使用 Markdown 表格或清晰的分段。
+    2. 突出各目标之间的风险差异。
+    3. 最后给出一个总体的风控建议。"""
+
+    response = await _llm.ainvoke([
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=f"这是各探员汇总回来的原始素材：\n{combined_context}")
+    ])
+
+    return {"messages": [response]}
+
+
+
+async def check_data_freshness_node(state: MessagesState):
+    """【哨兵】：水位检查"""
+    date = "2024-12-23"
+    return {"messages": [SystemMessage(content=f"当前数据水位：{date}")], "data_freshness": date}
