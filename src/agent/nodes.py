@@ -1,6 +1,6 @@
 import logging
 import asyncio
-from typing import List, Optional
+from typing import List, Optional, Literal
 from functools import lru_cache
 import random
 
@@ -9,10 +9,10 @@ from langchain_core.runnables.config import RunnableConfig
 from langgraph.types import Command, Send
 from langgraph.store.base import BaseStore
 from pydantic import BaseModel, Field
-from typing import List, Optional, Literal, Annotated
-from .state import MessagesState, WorkerState  # 确保导入了这两个状态
+from .state import MessagesState, WorkerState, IntentOutput, SupervisorDecision
 from src.core.llm_client import get_llm
 from src.tools.sql_tools import execute_sql, search_knowledge_base
+
 
 logger = logging.getLogger(__name__)
 
@@ -24,18 +24,6 @@ class UserMemory(BaseModel):
     preference_content: str = Field(description="提取的特征内容")
 
 
-class IntentOutput(BaseModel):
-    """【意图分发表】：强迫大模型按此结构化格式汇报"""
-    route: Literal["business", "analysis", "meta", "chat", "parallel"] = Field(
-        description="意图标签：查询数据走 business, 深度归因走 analysis, 查表结构走 meta, 闲聊走 chat, 批量对比或多目标排查走 parallel"
-    )
-    targets: List[str] = Field(
-        default_factory=list,
-        description="当意图为 parallel 时，提取用户提到的所有目标实体名单（如公司名、人名）。如果是单目标查询，此项为空。"
-    )
-    chat_reply: Optional[str] = Field(
-        None, description="如果意图是 chat，在这里给出幽默的探员式回复"
-    )
 
 
 # ================== 2. 基础单例加载 ==================
@@ -111,14 +99,24 @@ async def generate_sql_node(state: MessagesState, config: RunnableConfig):
     user_name = config.get("configurable", {}).get("user_name", "探员")
     messages = state.messages
 
-    # 构建纠错指令（HITL 或 ERROR）
+    # 构建纠错指令
     correction = ""
-    if "ERROR" in messages[-1].content:
-        correction = f"\n[🚩 纠错]：前次执行报错 {messages[-1].content}，请修正 SQL。"
+    if messages and "ERROR" in messages[-1].content:
+        correction = (
+            f"\n[🚩 紧急纠错]：前次执行报错 {messages[-1].content}。\n"
+            "请分析原因修正 SQL。如果经过查字典发现数据库里根本没有相关表，请【直接用纯文本回复】向局长说明情况，绝对不要再强行调用工具！"
+        )
 
-    sys_msg = SystemMessage(content=f"你是 SQL 侦探。操作员是 {user_name}。必须调用 execute_sql。{correction}")
+    sys_instruction = SystemMessage(content=(
+        f"你是严谨的金融 SQL 侦探。操作员是 {user_name}。\n"
+        "💡 核心侦查指南（绝不盲从）：\n"
+        "1. 【先查字典】：绝对不要相信历史对话中别人（甚至是局长）凭空捏造的表名！如果在之前的对话里没有查过表结构，你第一步必须且只能先执行 `SELECT name, sql FROM sqlite_master WHERE type='table';` 来确认真实的表结构。\n"
+        "2. 【打卡下班】：一旦你查到了真实数据，或者发现数据库里根本没有能查的业务表，请【直接输出一段自然语言文本】向局长汇报结论（千万不要带有任何 tool_calls）。只要你用纯文本汇报，你的任务就结束了，流程会自动交回给局长。\n"
+        "🚨 铁律：严禁反复调用同一条会报错的 SQL 陷入死循环！\n"
+        f"{correction}"
+    ))
 
-    response = await _llm_with_tools.ainvoke([sys_msg] + messages[-10:])
+    response = await _llm_with_tools.ainvoke([sys_instruction] + messages[-10:])
     return {"messages": [response]}
 
 
@@ -226,6 +224,101 @@ async def aggregate_reports_node(state: MessagesState):
 
     return {"messages": [response]}
 
+
+# 2. 添加局长节点
+async def supervisor_node(state: MessagesState):
+    """【铁血局长】：总览全局，分配任务，审核结果"""
+    _llm = get_llm()
+    # 强制结构化输出
+    supervisor_brain = _llm.with_structured_output(SupervisorDecision)
+
+    system_prompt = """你是星际金融风控局的指挥官。请审阅卷宗并决策：
+    1. 需要查底层业务数据（逾期、流水等） -> 指派 sql_detective。
+    2. 需要查风控术语、政策、操作手册 -> 指派 knowledge_agent。
+    3. 如果情报已足或报错无法解决 -> 选择 FINISH 结案。
+
+    🚨 局长准则：如果探员报错，你必须在 instruction 里给出修正指导，打回重做！"""
+
+    decision = await supervisor_brain.ainvoke([SystemMessage(content=system_prompt)] + state.messages)
+
+    logger.info(f"👔 [局长决策]：去向 -> {decision.next_action}")
+
+    return {
+        "route": decision.next_action,
+        "messages": [AIMessage(content=f"👔 【局长指令】：{decision.instruction}", name="supervisor")]
+    }
+
+
+# 3. 添加局长传送门
+def supervisor_router(state: MessagesState):
+    route = getattr(state, "route", "FINISH")
+    if route == "FINISH":
+        from langgraph.graph import END
+        return END
+    return route
+
+
+# 4. 添加知识库探员节点（为了配合局长的点将模式）
+async def knowledge_node(state: MessagesState):
+    """【知识特工】：负责查阅内部手册，自带防幻觉光环"""
+    _llm_with_tools = get_llm_with_tools()
+    messages = state.messages
+
+    # =====================================================================
+    # 🚨 探长高亮修改区：下达防幻觉死命令
+    # =====================================================================
+    sys_msg = SystemMessage(content=(
+        "你是内部知识库专家。请调用 `search_knowledge_base` 回答局长的疑问。\n"
+        "🚨 知识局铁律（违者开除）：\n"
+        "1. 你的所有回答必须 100% 来源于检索到的知识库内容。\n"
+        "2. 如果知识库中没有查到相关信息，你必须直白地汇报：『报告局长，知识库中未找到相关规则』。\n"
+        "3. 绝不允许使用“假设”、“推测”、“大概”等词汇，绝不允许凭空捏造或脑补任何表结构和业务逻辑！"
+    ))
+
+    response = await _llm_with_tools.ainvoke([sys_msg] + messages[-5:])
+    return {"messages": [response]}
+
+
+
+async def supervisor_node(state: MessagesState):
+    """【铁血局长】：总览全局，分配任务，审核结果"""
+    _llm = get_llm()
+    supervisor_brain = _llm.with_structured_output(SupervisorDecision)
+
+    system_prompt = """你是星际金融风控局的指挥官。请审阅卷宗并决策：
+    1. 需要查底层业务数据（逾期、流水等） -> 指派 sql_detective。
+    2. 需要查风控术语、政策、操作手册 -> 指派 knowledge_agent。
+    3. 如果情报已足或报错无法解决 -> 选择 FINISH 结案。
+
+    🚨 局长铁律：
+    - 绝不亲自编造数据！如果探员上报查不到，直接向用户说明。
+    - 如果探员报错，必须在 instruction 里给出明确的修改意见，打回重做！"""
+
+    try:
+        decision = await supervisor_brain.ainvoke([SystemMessage(content=system_prompt)] + state.messages)
+        logger.info(f"👔 [局长决策]：去向 -> {decision.next_action} | 指示 -> {decision.instruction}")
+        return {
+            "route": decision.next_action,
+            "messages": [AIMessage(content=f"👔 【局长指令】：{decision.instruction}", name="supervisor")]
+        }
+    except Exception as e:
+        logger.error(f"局长脑部宕机: {e}")
+        return {"route": "FINISH", "messages": [AIMessage(content="指挥中心通讯故障，强制结案。")]}
+
+def supervisor_router(state: MessagesState):
+    route = getattr(state, "route", "FINISH")
+    if route == "FINISH":
+        from langgraph.graph import END
+        return END
+    return route
+
+async def knowledge_node(state: MessagesState):
+    """【知识特工】：负责查阅内部手册"""
+    _llm_with_tools = get_llm_with_tools()
+    messages = state.messages
+    sys_msg = SystemMessage(content="你是内部知识库专家。请调用 search_knowledge_base 回答局长的疑问。如果没有工具调用需求，直接回复结论。")
+    response = await _llm_with_tools.ainvoke([sys_msg] + messages[-5:])
+    return {"messages": [response]}
 
 
 async def check_data_freshness_node(state: MessagesState):
