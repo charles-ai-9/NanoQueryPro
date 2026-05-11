@@ -59,3 +59,14 @@ def get_llm():
     except Exception as e:
         logger.error("LLM 初始化失败 (模式: %s): %s", mode, str(e))
         return None
+
+
+from functools import lru_cache
+
+
+@lru_cache(maxsize=1)
+def get_llm_with_tools():
+    """绑定 SQL 和知识库工具的 LLM 实例（单例缓存）"""
+    from src.tools.sql_tools import execute_sql, search_knowledge_base
+    _llm = get_llm()
+    return _llm.bind_tools([execute_sql, search_knowledge_base])
